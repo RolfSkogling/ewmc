@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  EWMC Memory — Nightly Consolidation (macOS launchd TEMPLATE)
+
+  Replace before use:
+    com.example.memory.consolidate  -> your own reverse-DNS label
+    /ABSOLUTE/PATH/TO/ewmc          -> the absolute path where you installed this repo
+
+  This template invokes the consolidate script with the project's own venv
+  python, so you do NOT need a custom shebang. Make sure .venv exists and has
+  the dependencies installed (see README.md).
+
+  Install:
+    cp com.example.memory.consolidate.plist ~/Library/LaunchAgents/
+    launchctl load ~/Library/LaunchAgents/com.example.memory.consolidate.plist
+
+  Unload:
+    launchctl unload ~/Library/LaunchAgents/com.example.memory.consolidate.plist
+
+  On Linux, use cron instead, e.g.:
+    15 3 * * *  /ABSOLUTE/PATH/TO/ewmc/.venv/bin/python /ABSOLUTE/PATH/TO/ewmc/bin/consolidate
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.example.memory.consolidate</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/ABSOLUTE/PATH/TO/ewmc/.venv/bin/python</string>
+        <string>/ABSOLUTE/PATH/TO/ewmc/bin/consolidate</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>15</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/ABSOLUTE/PATH/TO/ewmc/logs/launchd.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/ABSOLUTE/PATH/TO/ewmc/logs/launchd.err.log</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Don't wake the machine if asleep — just skip and try the next slot -->
+    <key>WakeFromSleep</key>
+    <false/>
+</dict>
+</plist>

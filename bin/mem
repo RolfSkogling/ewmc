@@ -1,0 +1,656 @@
+#!/usr/bin/env python3
+"""
+mem — EWMC Memory CLI
+
+A universal interface to a local, emotionally-weighted memory store. Any AI
+agent that can run a shell command (via an MCP tool, a bash tool, or a plain
+terminal) can use it, and so can a human. Every command supports --json for
+machine-readable output.
+
+Usage:
+    mem add "content" [--domain X] [--affect 0.8] [--tier 2] [--source agent]
+    mem search "query" [--top 5] [--domain X] [--tier 1,2] [--json]
+    mem recall "query" [--top 5]        # prints retrievable context block
+    mem promote <id> [--tier 1]
+    mem demote <id> [--tier 3]
+    mem remove <id>
+    mem show <id>
+    mem list [--tier 1] [--domain X] [--limit 20]
+    mem decay                            # apply decay step
+    mem consolidate [--dry-run]          # run full consolidation cycle
+    mem status                           # health overview
+    mem tier1                            # print current core_memories.yaml
+    mem init                             # initialize db (idempotent)
+
+Exit codes: 0 = success, 1 = error, 2 = not found
+
+NOTE on the interpreter: this file uses a portable `#!/usr/bin/env python3`
+shebang. Run it inside a virtualenv that has the dependencies installed (see
+README.md), e.g. `source .venv/bin/activate && bin/mem status`, or invoke it
+explicitly with your venv's python: `.venv/bin/python bin/mem status`.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sqlite3
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+# Allow running from anywhere — resolve our package dir
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = SCRIPT_DIR.parent
+sys.path.insert(0, str(ROOT_DIR))
+
+from lib import db as dbmod
+from lib import embeddings as emb
+from lib import ewmc
+
+try:
+    import yaml
+except ImportError:
+    print("ERROR: PyYAML required. Run: pip install pyyaml", file=sys.stderr)
+    sys.exit(1)
+
+
+def load_config() -> dict:
+    cfg_path = ROOT_DIR / "config.yaml"
+    if not cfg_path.exists():
+        print(f"ERROR: config.yaml not found at {cfg_path}", file=sys.stderr)
+        sys.exit(1)
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    # Resolve paths relative to ROOT_DIR
+    paths = cfg["paths"]
+    for key in ("db", "tier1_yaml", "log_dir"):
+        p = Path(paths[key])
+        if not p.is_absolute():
+            paths[key] = str(ROOT_DIR / p)
+    return cfg
+
+
+def get_conn(config: dict, readonly: bool = False) -> sqlite3.Connection:
+    return dbmod.connect(Path(config["paths"]["db"]), readonly=readonly)
+
+
+def _is_readonly_cmd(args) -> bool:
+    return getattr(args, 'cmd', None) in dbmod.READONLY_COMMANDS
+
+
+def ensure_initialized(config: dict) -> None:
+    """Initialize DB if writable; silently skip if read-only (sandbox)."""
+    try:
+        conn = get_conn(config)
+        schema = ROOT_DIR / "schema.sql"
+        dbmod.init_schema(conn, schema)
+        conn.close()
+    except sqlite3.OperationalError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+def cmd_init(args, config):
+    ensure_initialized(config)
+    print(f"Initialized memory store at {config['paths']['db']}")
+    print(f"Schema applied from {ROOT_DIR / 'schema.sql'}")
+
+
+def cmd_add(args, config):
+    ensure_initialized(config)
+    conn = get_conn(config)
+
+    content = args.content
+    domain = args.domain
+    source = args.source or "cli"
+    tier = args.tier
+
+    # Score affect: explicit override > LLM (future) > heuristic
+    if args.affect is not None:
+        affect = max(0.0, min(1.0, args.affect))
+        # Heuristic still gives us valence
+        _, valence = ewmc.score_affect_heuristic(content)
+    else:
+        affect, valence = ewmc.score_affect_heuristic(content)
+
+    if args.valence:
+        valence = args.valence
+
+    # Refuse to store memories below affect threshold (unless forced)
+    min_aff = config["ewmc"]["min_affect_to_store"]
+    if affect < min_aff and not args.force:
+        msg = f"Affect score {affect:.2f} below threshold {min_aff}; skipping. Use --force to override."
+        if args.json:
+            print(json.dumps({"stored": False, "reason": msg, "affect": affect}))
+        else:
+            print(msg, file=sys.stderr)
+        sys.exit(0)
+
+    floor = ewmc.compute_floor(affect, valence, config)
+    decay_rate = ewmc.tier_decay_rate(tier, config)
+    if valence == "negative":
+        decay_rate *= config["ewmc"]["negative_valence_decay_multiplier"]
+
+    # Embedding (best-effort; ok to skip if Ollama not running)
+    embedding_blob = None
+    embedding_model = None
+    try:
+        vec = emb.embed(content,
+                        model=config["embeddings"]["model"],
+                        ollama_url=config["embeddings"]["ollama_url"])
+        embedding_blob = dbmod.encode_embedding(vec)
+        embedding_model = config["embeddings"]["model"]
+    except emb.EmbeddingError as e:
+        if not args.json:
+            print(f"Warning: embedding skipped ({e})", file=sys.stderr)
+
+    cursor = conn.execute(
+        """INSERT INTO memories
+           (content, domain, tier, affect_score, consequence, valence,
+            decay_rate, floor_weight, current_weight, source, session_id,
+            embedding, embedding_model)
+           VALUES (?, ?, ?, ?, 0.0, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (content, domain, tier, affect, valence, decay_rate, floor,
+         max(affect, floor), source, args.session, embedding_blob, embedding_model),
+    )
+    mem_id = cursor.lastrowid
+
+    out = {
+        "id": mem_id,
+        "stored": True,
+        "affect": round(affect, 3),
+        "valence": valence,
+        "tier": tier,
+        "floor_weight": round(floor, 3),
+        "decay_rate": round(decay_rate, 4),
+        "embedded": embedding_blob is not None,
+    }
+    if args.json:
+        print(json.dumps(out))
+    else:
+        print(f"#{mem_id} stored | affect={affect:.2f} valence={valence} tier={tier} "
+              f"floor={floor:.2f} embedded={embedding_blob is not None}")
+    conn.close()
+
+
+def cmd_search(args, config):
+    ensure_initialized(config)
+    try:
+        conn = get_conn(config)
+        _search_readonly_fallback = False
+    except sqlite3.OperationalError:
+        conn = get_conn(config, readonly=True)
+        _search_readonly_fallback = True
+
+    # Embed the query
+    try:
+        qvec = emb.embed(args.query,
+                         model=config["embeddings"]["model"],
+                         ollama_url=config["embeddings"]["ollama_url"])
+    except emb.EmbeddingError as e:
+        # Fallback: pure LIKE search
+        _search_textonly(args, config, conn)
+        conn.close()
+        return
+
+    # Fetch candidates (filtered by domain/tier if provided)
+    where_clauses = ["embedding IS NOT NULL"]
+    params: list = []
+    if args.domain:
+        where_clauses.append("domain = ?")
+        params.append(args.domain)
+    if args.tier:
+        tiers = [int(t) for t in args.tier.split(",")]
+        placeholders = ",".join("?" * len(tiers))
+        where_clauses.append(f"tier IN ({placeholders})")
+        params.extend(tiers)
+
+    sql = f"""SELECT id, content, summary, domain, tier, affect_score, consequence,
+                    current_weight, valence, embedding, created_at, last_accessed
+              FROM memories WHERE {' AND '.join(where_clauses)}"""
+    rows = conn.execute(sql, params).fetchall()
+
+    threshold = config["retrieval"]["similarity_threshold"]
+    domain_boost = config["retrieval"]["domain_filter_boost"]
+
+    scored = []
+    for r in rows:
+        cvec = dbmod.decode_embedding(r["embedding"])
+        if cvec is None:
+            continue
+        sim = emb.cosine_similarity(qvec, cvec)
+        # Combine similarity with EWMC weight for ranking
+        weighted = sim * (0.5 + 0.5 * r["current_weight"])
+        if args.domain and r["domain"] == args.domain:
+            weighted += domain_boost
+        if sim >= threshold:
+            scored.append((r, sim, weighted))
+
+    scored.sort(key=lambda x: x[2], reverse=True)
+    top = scored[: args.top]
+
+    # Always include tier-1 if configured and not already present
+    if config["retrieval"]["include_tier1_always"] and not args.no_tier1:
+        tier1_rows = conn.execute(
+            "SELECT id, content, summary, domain, tier, affect_score, consequence, "
+            "current_weight, valence, created_at, last_accessed "
+            "FROM memories WHERE tier = 1"
+        ).fetchall()
+        existing_ids = {r["id"] for r, _, _ in top}
+        for t1 in tier1_rows:
+            if t1["id"] not in existing_ids:
+                top.append((t1, 1.0, 1.0))
+
+    # Reinforce on access — skip silently if DB is read-only
+    if not _search_readonly_fallback:
+        for r, _, _ in top:
+            try:
+                ewmc.reinforce_on_access(conn, r["id"], source=args.source or "cli",
+                                         query=args.query, config=config)
+            except sqlite3.OperationalError:
+                break
+
+    # Output
+    results = []
+    for r, sim, weighted in top:
+        results.append({
+            "id": r["id"],
+            "content": r["content"],
+            "summary": r["summary"],
+            "domain": r["domain"],
+            "tier": r["tier"],
+            "similarity": round(sim, 3),
+            "weight": round(r["current_weight"], 3),
+            "affect": round(r["affect_score"], 3),
+            "created_at": r["created_at"],
+        })
+
+    if args.json:
+        print(json.dumps({"query": args.query, "results": results}, ensure_ascii=False))
+    else:
+        if not results:
+            print("(no matches)")
+        for r in results:
+            print(f"#{r['id']} [t{r['tier']}|{r['domain'] or '-'}] "
+                  f"sim={r['similarity']:.2f} w={r['weight']:.2f}")
+            print(f"   {r['content'][:200]}")
+            print()
+
+    conn.close()
+
+
+def _search_textonly(args, config, conn):
+    """Fallback text search when embeddings unavailable. Case-insensitive.
+
+    Tokenizes the query on whitespace and OR-matches each token across
+    content, summary, AND domain. So a two-word query matches rows where
+    either token appears in any of the three columns, and a single token
+    matches memories tagged with that --domain even when the word isn't in
+    the content. Robustness fallback only — the primary semantic path
+    remains embedding-based when Ollama is reachable.
+    """
+    tokens = [t for t in args.query.lower().split() if t]
+    if not tokens:
+        tokens = [args.query.lower()]
+
+    clauses = []
+    params = []
+    for tok in tokens:
+        pat = f"%{tok}%"
+        clauses.append(
+            "(lower(content) LIKE ? "
+            "OR lower(COALESCE(summary,'')) LIKE ? "
+            "OR lower(COALESCE(domain,'')) LIKE ?)"
+        )
+        params.extend([pat, pat, pat])
+
+    where = " OR ".join(clauses)
+    params.append(args.top)
+
+    rows = conn.execute(
+        f"""SELECT id, content, domain, tier, current_weight, affect_score
+            FROM memories WHERE {where}
+            ORDER BY current_weight DESC LIMIT ?""",
+        tuple(params),
+    ).fetchall()
+    results = [dict(r) for r in rows]
+    if args.json:
+        print(json.dumps({"query": args.query, "results": results,
+                          "mode": "text_fallback"}, ensure_ascii=False))
+    else:
+        print("(text search fallback — embeddings unavailable)")
+        if not results:
+            print("(no matches)")
+        for r in results:
+            print(f"#{r['id']} [t{r['tier']}|{r['domain'] or '-'}] w={r['current_weight']:.2f}")
+            print(f"   {r['content'][:200]}")
+            print()
+
+
+def cmd_recall(args, config):
+    """Like search, but formats output as a context block ready to inject into an LLM."""
+    ensure_initialized(config)
+    try:
+        conn = get_conn(config)
+        _recall_readonly_fallback = False
+    except sqlite3.OperationalError:
+        conn = get_conn(config, readonly=True)
+        _recall_readonly_fallback = True
+
+    try:
+        qvec = emb.embed(args.query,
+                         model=config["embeddings"]["model"],
+                         ollama_url=config["embeddings"]["ollama_url"])
+    except emb.EmbeddingError:
+        print("# (memory unavailable — Ollama not reachable)", file=sys.stderr)
+        return
+
+    rows = conn.execute(
+        "SELECT id, content, summary, domain, tier, current_weight, embedding "
+        "FROM memories WHERE embedding IS NOT NULL"
+    ).fetchall()
+
+    scored = []
+    for r in rows:
+        cvec = dbmod.decode_embedding(r["embedding"])
+        if cvec is None:
+            continue
+        sim = emb.cosine_similarity(qvec, cvec)
+        weighted = sim * (0.5 + 0.5 * r["current_weight"])
+        scored.append((r, sim, weighted))
+
+    scored.sort(key=lambda x: x[2], reverse=True)
+    top = [s for s in scored if s[1] >= config["retrieval"]["similarity_threshold"]][:args.top]
+
+    # Reinforce — skip silently if DB is read-only
+    if not _recall_readonly_fallback:
+        for r, _, _ in top:
+            try:
+                ewmc.reinforce_on_access(conn, r["id"], source=args.source or "recall",
+                                         query=args.query, config=config)
+            except sqlite3.OperationalError:
+                break
+
+    # Format as context block
+    print("# Relevant memory context")
+    print(f"# Query: {args.query}")
+    print(f"# Retrieved {len(top)} memories")
+    print()
+    for r, sim, _ in top:
+        text = r["summary"] or r["content"]
+        print(f"- [{r['domain'] or 'general'}] {text}")
+    conn.close()
+
+
+def cmd_promote(args, config):
+    conn = get_conn(config)
+    target_tier = args.tier or 1
+    # Recompute floor and decay for new tier
+    row = conn.execute("SELECT affect_score, valence FROM memories WHERE id = ?",
+                       (args.id,)).fetchone()
+    if not row:
+        print(f"Memory #{args.id} not found", file=sys.stderr)
+        sys.exit(2)
+    new_decay = ewmc.tier_decay_rate(target_tier, config)
+    conn.execute(
+        """UPDATE memories
+           SET tier = ?, decay_rate = ?, current_weight = MAX(current_weight, 0.9),
+               last_consolidated = CURRENT_TIMESTAMP
+           WHERE id = ?""",
+        (target_tier, new_decay, args.id),
+    )
+    print(f"Memory #{args.id} promoted to tier {target_tier}")
+    conn.close()
+
+
+def cmd_demote(args, config):
+    conn = get_conn(config)
+    target_tier = args.tier or 3
+    new_decay = ewmc.tier_decay_rate(target_tier, config)
+    conn.execute(
+        "UPDATE memories SET tier = ?, decay_rate = ?, last_consolidated = CURRENT_TIMESTAMP WHERE id = ?",
+        (target_tier, new_decay, args.id),
+    )
+    print(f"Memory #{args.id} demoted to tier {target_tier}")
+    conn.close()
+
+
+def cmd_remove(args, config):
+    conn = get_conn(config)
+    result = conn.execute("DELETE FROM memories WHERE id = ?", (args.id,))
+    if result.rowcount == 0:
+        print(f"Memory #{args.id} not found", file=sys.stderr)
+        sys.exit(2)
+    print(f"Memory #{args.id} removed")
+    conn.close()
+
+
+def cmd_show(args, config):
+    conn = get_conn(config, readonly=True)
+    row = conn.execute(
+        "SELECT * FROM memories WHERE id = ?", (args.id,)
+    ).fetchone()
+    if not row:
+        print(f"Memory #{args.id} not found", file=sys.stderr)
+        sys.exit(2)
+    d = {k: row[k] for k in row.keys() if k != "embedding"}
+    d["has_embedding"] = row["embedding"] is not None
+    if args.json:
+        print(json.dumps(d, ensure_ascii=False, default=str))
+    else:
+        for k, v in d.items():
+            print(f"  {k}: {v}")
+    conn.close()
+
+
+def cmd_list(args, config):
+    conn = get_conn(config, readonly=True)
+    where, params = [], []
+    if args.tier:
+        tiers = [int(t) for t in args.tier.split(",")]
+        where.append(f"tier IN ({','.join('?'*len(tiers))})")
+        params.extend(tiers)
+    if args.domain:
+        where.append("domain = ?")
+        params.append(args.domain)
+    sql = "SELECT id, content, domain, tier, current_weight, affect_score, created_at FROM memories"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY current_weight DESC LIMIT ?"
+    params.append(args.limit)
+    rows = conn.execute(sql, params).fetchall()
+    if args.json:
+        print(json.dumps([dict(r) for r in rows], ensure_ascii=False, default=str))
+    else:
+        for r in rows:
+            print(f"#{r['id']:>4} [t{r['tier']}|{r['domain'] or '-':<12}] "
+                  f"w={r['current_weight']:.2f} a={r['affect_score']:.2f}")
+            print(f"      {r['content'][:120]}")
+    conn.close()
+
+
+def cmd_decay(args, config):
+    conn = get_conn(config)
+    n = ewmc.apply_decay(conn, config)
+    print(f"Decay applied to {n} memories")
+    conn.close()
+
+
+def cmd_consolidate(args, config):
+    conn = get_conn(config)
+    stats = ewmc.run_consolidation(conn, config, dry_run=args.dry_run)
+    if args.json:
+        print(json.dumps(stats))
+    else:
+        print(f"Consolidation {'(DRY RUN)' if args.dry_run else ''}:")
+        for k, v in stats.items():
+            print(f"  {k}: {v}")
+    conn.close()
+
+
+def cmd_status(args, config):
+    conn = get_conn(config, readonly=True)
+    counts = {}
+    for tier in (1, 2, 3, 4):
+        counts[f"tier_{tier}"] = conn.execute(
+            "SELECT COUNT(*) AS c FROM memories WHERE tier = ?", (tier,)
+        ).fetchone()["c"]
+    total = sum(counts.values())
+    avg_weight = conn.execute(
+        "SELECT AVG(current_weight) AS w FROM memories"
+    ).fetchone()["w"] or 0.0
+    last_consolidation = conn.execute(
+        "SELECT run_at FROM consolidation_log ORDER BY run_at DESC LIMIT 1"
+    ).fetchone()
+    top5 = conn.execute(
+        "SELECT id, content, current_weight FROM memories ORDER BY current_weight DESC LIMIT 5"
+    ).fetchall()
+
+    out = {
+        "total": total,
+        **counts,
+        "avg_weight": round(avg_weight, 3),
+        "last_consolidation": last_consolidation["run_at"] if last_consolidation else None,
+        "top5": [{"id": r["id"], "weight": round(r["current_weight"], 3),
+                  "preview": r["content"][:80]} for r in top5],
+    }
+    if args.json:
+        print(json.dumps(out, ensure_ascii=False))
+    else:
+        print(f"Total memories: {total}")
+        for tier in (1, 2, 3, 4):
+            print(f"  Tier {tier}: {counts[f'tier_{tier}']}")
+        print(f"Average weight: {avg_weight:.3f}")
+        print(f"Last consolidation: {out['last_consolidation'] or 'never'}")
+        print("Top 5 by weight:")
+        for r in top5:
+            print(f"  #{r['id']} w={r['current_weight']:.2f}  {r['content'][:80]}")
+    conn.close()
+
+
+def cmd_tier1(args, config):
+    """Print the tier-1 core memories as YAML — for injecting into AI context."""
+    conn = get_conn(config, readonly=True)
+    rows = conn.execute(
+        "SELECT id, content, domain FROM memories WHERE tier = 1 ORDER BY current_weight DESC"
+    ).fetchall()
+
+    # Merge with manually-maintained core_memories.yaml if it exists
+    manual_path = Path(config["paths"]["tier1_yaml"])
+    manual = {}
+    if manual_path.exists():
+        with open(manual_path, "r", encoding="utf-8") as f:
+            manual = yaml.safe_load(f) or {}
+
+    output = {
+        "manual_core": manual,
+        "db_tier1": [
+            {"id": r["id"], "domain": r["domain"], "content": r["content"]}
+            for r in rows
+        ],
+    }
+    print(yaml.dump(output, allow_unicode=True, sort_keys=False))
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="mem", description="EWMC Memory CLI")
+    p.add_argument("--json", action="store_true", help="Machine-readable output")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def _add_common(parser):
+        # Allow --json to appear after the subcommand too
+        parser.add_argument("--json", action="store_true",
+                            help="Machine-readable output")
+        return parser
+
+    a = _add_common(sub.add_parser("init"))
+    a.set_defaults(func=cmd_init)
+
+    a = _add_common(sub.add_parser("add"))
+    a.add_argument("content")
+    a.add_argument("--domain")
+    a.add_argument("--affect", type=float, help="Override affect score (0–1)")
+    a.add_argument("--valence", choices=["positive", "negative", "neutral"])
+    a.add_argument("--tier", type=int, default=2)
+    a.add_argument("--source", default="cli")
+    a.add_argument("--session")
+    a.add_argument("--force", action="store_true", help="Store even below affect threshold")
+    a.set_defaults(func=cmd_add)
+
+    a = _add_common(sub.add_parser("search"))
+    a.add_argument("query")
+    a.add_argument("--top", type=int, default=5)
+    a.add_argument("--domain")
+    a.add_argument("--tier", help="Comma-separated tiers, e.g. 1,2")
+    a.add_argument("--source", default="cli")
+    a.add_argument("--no-tier1", action="store_true", help="Don't auto-include tier-1")
+    a.set_defaults(func=cmd_search)
+
+    a = _add_common(sub.add_parser("recall"))
+    a.add_argument("query")
+    a.add_argument("--top", type=int, default=5)
+    a.add_argument("--source", default="cli")
+    a.set_defaults(func=cmd_recall)
+
+    a = _add_common(sub.add_parser("promote"))
+    a.add_argument("id", type=int)
+    a.add_argument("--tier", type=int, default=1)
+    a.set_defaults(func=cmd_promote)
+
+    a = _add_common(sub.add_parser("demote"))
+    a.add_argument("id", type=int)
+    a.add_argument("--tier", type=int, default=3)
+    a.set_defaults(func=cmd_demote)
+
+    a = _add_common(sub.add_parser("remove"))
+    a.add_argument("id", type=int)
+    a.set_defaults(func=cmd_remove)
+
+    a = _add_common(sub.add_parser("show"))
+    a.add_argument("id", type=int)
+    a.set_defaults(func=cmd_show)
+
+    a = _add_common(sub.add_parser("list"))
+    a.add_argument("--tier")
+    a.add_argument("--domain")
+    a.add_argument("--limit", type=int, default=20)
+    a.set_defaults(func=cmd_list)
+
+    a = _add_common(sub.add_parser("decay"))
+    a.set_defaults(func=cmd_decay)
+
+    a = _add_common(sub.add_parser("consolidate"))
+    a.add_argument("--dry-run", action="store_true")
+    a.set_defaults(func=cmd_consolidate)
+
+    a = _add_common(sub.add_parser("status"))
+    a.set_defaults(func=cmd_status)
+
+    a = _add_common(sub.add_parser("tier1"))
+    a.set_defaults(func=cmd_tier1)
+
+    return p
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    config = load_config()
+    # Side-effect: search and recall reinforce on access (write). Treat them
+    # as writes if writable; fall back to read-only on permission errors.
+    args.func(args, config)
+
+
+if __name__ == "__main__":
+    main()

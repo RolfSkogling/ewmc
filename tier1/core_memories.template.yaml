@@ -1,0 +1,62 @@
+# Tier 1 — Core Memories (Always-in-Context)  [TEMPLATE]
+#
+# Copy this file to `core_memories.yaml` and fill it in. This is the
+# human-curated single source of truth for what every AI instance must know
+# before doing anything. It is NOT generated — you own and edit it by hand.
+#
+# Inject this file's content into the system prompt / context of any AI tool.
+# The CLI command `mem tier1` prints it (plus any tier-1 memories promoted in
+# the database) as YAML, ready to paste.
+#
+# The database tier-1 is additive — for memories that arose during work and
+# were promoted. This file stays small, stable, and authoritative.
+#
+# Everything below is placeholder structure. Replace the <...> values.
+# Add or remove sections to fit your own life/work — nothing here is required.
+
+identity:
+  name: <your name or handle>
+  base: <your location / timezone, optional>
+  role: <what you do — one line>
+  profile: <a sentence on how you like to work>
+
+active_specialization:
+  domains:
+    - <domain or area you work in>
+    - <another domain>
+  collaboration:
+    - <how you prefer to collaborate with AI tools>
+
+active_projects:
+  - <short label for a current project>
+  - <another current project>
+
+frameworks:
+  framework_a:
+    name: <name of a framework/idea you maintain>
+    domain: <area>
+    status: <draft | active | published | archived>
+  framework_b:
+    name: <another, optional>
+    domain: <area>
+    status: <draft | active | published | archived>
+
+publications:
+  - <a thing you have published, optional>
+
+standing_instructions:
+  language: <preferred working language(s)>
+  quality_discipline: <e.g. "show your reasoning; verify claims">
+  content_firewall: >
+    <Optional: describe any topics, clients, or data that must NEVER be
+    written into shared/synced memory or sent to external services. Keep the
+    sensitive specifics OUT of this public template — put them only in your
+    private, local copy.>
+  silent_context: <e.g. "load memory quietly; don't narrate tool calls">
+  memory_discipline: <e.g. "store decisions and breakthroughs, not chatter">
+
+# Optional free-form sections — add whatever you want the assistant to always
+# know (health, preferences, recurring people, etc.). Keep it tight; tier 1 is
+# meant to be the *few* things that are always relevant.
+notes:
+  - <anything else that should always be in context>

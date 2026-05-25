@@ -1,0 +1,35 @@
+# --- EWMC memory store: never commit your actual memory data ---
+*.db
+*.db-wal
+*.db-shm
+memory.db*
+
+# Your real tier-1 core memories (copy the template, fill it in, keep it local)
+tier1/core_memories.yaml
+
+# Database dumps / backups (may contain private content)
+dumps/
+*.sql.dump
+*.dump
+
+# Logs
+logs/
+*.log
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.Python
+*.egg-info/
+
+# Secrets / tokens — never commit these
+*.token
+*secret*
+.env
+*.pem
+
+# OS noise
+.DS_Store

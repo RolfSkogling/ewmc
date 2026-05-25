@@ -1,0 +1,72 @@
+# EWMC Memory System — Configuration
+# All relative paths are resolved against the repo root (the directory that
+# contains this file). Absolute paths are used as-is.
+# Edit freely; changes take effect on the next `mem` invocation.
+
+paths:
+  db: memory.db
+  tier1_yaml: tier1/core_memories.yaml
+  log_dir: logs
+
+embeddings:
+  # Use a local Ollama embedding model — must be pulled first:
+  #   ollama pull nomic-embed-text
+  model: nomic-embed-text:latest
+  dim: 768
+  ollama_url: http://localhost:11434
+
+llm:
+  # Used by the consolidator for summarization when demoting memories.
+  # Point this at any local chat model you have pulled in Ollama, e.g.:
+  #   ollama pull llama3.1:8b
+  model: llama3.1:8b
+  ollama_url: http://localhost:11434
+
+ewmc:
+  # Affect scoring at encoding — minimum score to store at all
+  min_affect_to_store: 0.15
+
+  # Tier promotion thresholds
+  tier1_promote_at_consequence: 0.85   # very high consequence → core
+  tier3_demote_at_weight: 0.20         # weight below this → archive
+  tier4_remove_at_age_days: 90         # ephemeral past this → delete
+
+  # Decay parameters (per-day exponential)
+  decay_rate_default: 0.05
+  decay_rate_tier1: 0.0                # tier 1 never decays
+  decay_rate_tier2: 0.03               # active projects decay slowly
+  decay_rate_tier3: 0.10               # archived decay faster
+  decay_rate_tier4: 0.30               # ephemeral decay fast
+
+  # Emotional floor — high-affect memories cannot decay below this
+  floor_high_affect: 0.40              # affect >= 0.7
+  floor_medium_affect: 0.15            # affect 0.4–0.7
+  floor_low_affect: 0.0                # affect < 0.4
+
+  # Recurrence reinforcement
+  recurrence_boost: 0.05               # added to consequence per retrieval
+  recurrence_threshold_promote: 3      # retrievals before tier promotion review
+
+  # Negative valence asymmetry (avoid trauma loops)
+  negative_valence_decay_multiplier: 1.5   # negative memories decay 50% faster
+  negative_valence_floor_multiplier: 0.5   # and have lower emotional floor
+
+retrieval:
+  default_top_k: 5
+  similarity_threshold: 0.25            # cosine, below this is irrelevant
+  include_tier1_always: true
+  domain_filter_boost: 0.1             # bonus for matching domain
+
+consolidation:
+  # When the nightly job runs (used by the launchd plist / cron).
+  # Defaults to 03:15 local time
+  hour: 3
+  minute: 15
+
+  # Capacity triggers
+  max_active_memories: 500             # if exceeded, force tier-2 → tier-3 review
+  max_tier1_entries: 30                # tier-1 should stay tight
+
+  # Summarization
+  summarize_at_tier_demotion: true     # use LLM to compress when demoting
+  summary_max_tokens: 80

@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""
+consolidate — Nightly background consolidation cycle.
+
+Invoked by a scheduler (launchd / cron) at the configured time. Runs the full
+EWMC consolidation procedure: decay, tier transitions, summarization, cleanup.
+
+Logs to <repo>/logs/consolidation-YYYY-MM-DD.log
+
+Run it inside the project's virtualenv (see README.md), e.g. via the launchd
+template that points at .venv/bin/python.
+"""
+from __future__ import annotations
+
+import json
+import sys
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = SCRIPT_DIR.parent
+sys.path.insert(0, str(ROOT_DIR))
+
+from lib import db as dbmod
+from lib import ewmc
+
+try:
+    import yaml
+except ImportError:
+    print("ERROR: PyYAML required", file=sys.stderr)
+    sys.exit(1)
+
+
+def load_config() -> dict:
+    cfg = yaml.safe_load((ROOT_DIR / "config.yaml").read_text(encoding="utf-8"))
+    for key in ("db", "tier1_yaml", "log_dir"):
+        p = Path(cfg["paths"][key])
+        if not p.is_absolute():
+            cfg["paths"][key] = str(ROOT_DIR / p)
+    return cfg
+
+
+def make_summarizer(config: dict):
+    """Returns a callable(text) -> str using local Ollama."""
+    model = config["llm"]["model"]
+    url = config["llm"]["ollama_url"]
+
+    def summarize(text: str) -> str:
+        prompt = (
+            "Summarize the following memory in one short sentence (max 25 words). "
+            "Preserve key facts, names, decisions. Drop process detail.\n\n"
+            f"Memory:\n{text}\n\nSummary:"
+        )
+        payload = json.dumps({
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"temperature": 0.2, "num_predict": 80},
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"{url}/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        return data.get("response", "").strip()
+
+    return summarize
+
+
+def main():
+    config = load_config()
+    log_dir = Path(config["paths"]["log_dir"])
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"consolidation-{datetime.now():%Y-%m-%d}.log"
+
+    def log(msg: str):
+        ts = datetime.now().isoformat(timespec="seconds")
+        line = f"[{ts}] {msg}"
+        print(line)
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+
+    log("=== Starting nightly consolidation ===")
+    conn = dbmod.connect(Path(config["paths"]["db"]))
+
+    # Try to set up summarizer; fall back to no-summary if Ollama unreachable
+    summarizer = None
+    try:
+        summarizer = make_summarizer(config)
+        # quick health check
+        summarizer("test")
+        log(f"Summarizer ready: {config['llm']['model']}")
+    except Exception as e:
+        log(f"Summarizer unavailable ({e}); will demote without compression")
+        summarizer = None
+
+    try:
+        stats = ewmc.run_consolidation(conn, config, summarizer=summarizer, dry_run=False)
+        log(f"Stats: {json.dumps(stats)}")
+    except Exception as e:
+        log(f"ERROR during consolidation: {e}")
+        raise
+    finally:
+        conn.close()
+
+    log("=== Consolidation complete ===\n")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,6 @@
+# EWMC Memory CLI — Python dependencies
+# Install into a virtualenv (see README.md):
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+PyYAML>=6.0
+numpy>=1.24
