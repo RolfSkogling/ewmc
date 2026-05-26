@@ -93,7 +93,7 @@ metaphor seriously. Treat the framing as engineering opinion backed by prior
 art, not as a validated cognitive model.
 
 If you want to cite the conceptual write-up that this implementation pairs with,
-see the companion paper referenced by the project owner. This repository is the
+see the companion paper: [EWMC — Emotionally-Weighted Memory Consolidation (white paper)](paper/EWMC-white-paper.md). This repository is the
 runnable artifact.
 
 ---
