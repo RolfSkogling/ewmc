@@ -206,4 +206,4 @@ ewmc/
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Replace the copyright holder before publishing.
+MIT — see [LICENSE](LICENSE).
